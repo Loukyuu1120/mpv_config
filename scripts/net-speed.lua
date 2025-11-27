@@ -1,5 +1,5 @@
 -- net-speed.lua
--- 高精度：0.1s 高频采样 + 滑动时间窗积分 + 协议开销补偿
+-- 高精度网速显示
 
 local mp = require 'mp'
 local options = require 'mp.options'
@@ -9,6 +9,10 @@ local opts = {
     enable = true,
     integration_window = 2.0,
     overhead_compensation = 1.05,
+
+    -- 自动隐藏设置
+    auto_hide = true,      -- 是否开启自动隐藏
+    hide_timeout = 5,      -- 速度为0持续多少秒后隐藏
 
     -- 过滤设置
     show_network = true,
@@ -41,9 +45,12 @@ local timer = nil
 local last_check_time = nil
 local last_fw_bytes = 0
 
--- 采样队列：存储 {time, bytes}
+-- 采样队列
 local samples = {} 
 local is_visible = opts.enable
+
+-- 【新增】用于记录速度为0的开始时间
+local zero_speed_start_time = nil 
 
 -- === 工具函数 ===
 local function split_string(str, sep)
@@ -76,10 +83,9 @@ local function should_show()
 end
 
 local function format_speed(bps)
-    -- 应用开销补偿
     bps = bps * opts.overhead_compensation
-
     if bps < 0 then bps = 0 end
+    
     local speed_str = ""
     if opts.units == "KB" then
         speed_str = string.format("%."..opts.decimals.."f KB/s", bps/1024)
@@ -98,6 +104,12 @@ local function format_speed(bps)
 end
 
 local function draw_osd(text)
+    -- 如果传入空文本，直接清除 OSD
+    if not text or text == "" then
+        mp.set_osd_ass(0, 0, "")
+        return
+    end
+
     local an = 9
     if opts.position == "top-left" then an = 7
     elseif opts.position == "top-right" then an = 9
@@ -138,52 +150,61 @@ local function tick()
     local demuxer_cache = mp.get_property_native("demuxer-cache-state", {})
     local fw_bytes = demuxer_cache["fw-bytes"] or 0
     
-    -- 1. 计算本次微小间隔内的增量
     local delta = 0
     if last_fw_bytes then
         delta = fw_bytes - last_fw_bytes
     end
-    
-    -- 处理 Seek 或重置的情况 (delta 异常大或为负)
     if delta < 0 then delta = 0 end 
     
-    -- 2. 存入采样队列 {时间戳, 字节增量}
     table.insert(samples, {t = t_now, b = delta})
     last_fw_bytes = fw_bytes
     last_check_time = t_now
 
-    -- 3. 清理过期的采样 (超出 integration_window 的)
     local cutoff_time = t_now - opts.integration_window
-    -- 从头开始移除，直到列表头的每一个都在窗口内
     while #samples > 0 and samples[1].t < cutoff_time do
         table.remove(samples, 1)
     end
 
-    -- 4. 积分求和
     local total_bytes = 0
     for _, sample in ipairs(samples) do
         total_bytes = total_bytes + sample.b
     end
 
-    -- 5. 计算有效时长
-    -- 如果样本不足(刚开始)，用实际时长；如果样本满了，就是窗口时长
     local effective_duration = opts.integration_window
     if #samples > 0 then
         local earliest = samples[1].t
         local duration = t_now - earliest
-        -- 防止除零，并平滑启动阶段
         if duration < opts.integration_window then
-            -- 启动阶段，为了防止数字跳太大，我们假设时间至少有0.5秒
             effective_duration = math.max(duration, 0.5) 
         end
     end
 
     local speed = total_bytes / effective_duration
-    
-    -- 极小值过滤
     if speed < 1 then speed = 0 end
 
-    draw_osd(format_speed(speed))
+    -- === 自动隐藏逻辑的核心修改 ===
+    if speed > 0 then
+        -- 有速度：重置计时器，正常显示
+        zero_speed_start_time = nil
+        draw_osd(format_speed(speed))
+    else
+        -- 速度为 0
+        if not zero_speed_start_time then
+            -- 刚开始变成 0，记录时间
+            zero_speed_start_time = t_now
+        end
+
+        -- 计算已经持续 0 速多久了
+        local idle_time = t_now - zero_speed_start_time
+
+        if opts.auto_hide and idle_time > opts.hide_timeout then
+            -- 超时了，隐藏显示
+            mp.set_osd_ass(0, 0, "")
+        else
+            -- 还没超时，显示 0 B/s 或者 0.0 KB/s
+            draw_osd(format_speed(0))
+        end
+    end
 end
 
 -- 状态管理
@@ -191,14 +212,12 @@ local function check_state()
     local show = should_show()
     if is_visible and show then
         if not timer or not timer:is_enabled() then
-            -- 初始化
             local cache = mp.get_property_native("demuxer-cache-state", {})
             last_fw_bytes = cache["fw-bytes"] or 0
             last_check_time = mp.get_time()
-            samples = {} -- 重置采样队列
+            samples = {} 
+            zero_speed_start_time = nil -- 初始化时重置计时
             
-            -- 【关键】采样频率：0.1秒
-            -- 刷新频率必须很高，才能捕捉到瞬间的流量变化
             if timer then timer:resume()
             else timer = mp.add_periodic_timer(0.1, tick) end
         end
@@ -210,6 +229,7 @@ end
 
 local function toggle()
     is_visible = not is_visible
+    zero_speed_start_time = nil -- 手动切换时重置计时
     local msg = is_visible and "Net Speed: ON" or "Net Speed: OFF"
     mp.osd_message(msg)
     check_state()
