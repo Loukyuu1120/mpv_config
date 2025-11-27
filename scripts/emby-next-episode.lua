@@ -64,6 +64,57 @@ local function get_server_base_url(url)
     return url:match("^(https?://[^/?#]+)")
 end
 
+-- ===========================================================================
+-- 新增功能：DeviceId 持久化存储与生成
+-- ===========================================================================
+
+-- 获取存储 DeviceId 的文件路径 (位于 script-opts 目录下)
+local function get_device_id_path()
+    return mp.command_native({"expand-path", "~~/script-opts/emby_generated_id.txt"})
+end
+
+-- 生成随机的 32 位十六进制 ID
+local function generate_random_id()
+    math.randomseed(os.time())
+    local template = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    return string.gsub(template, "x", function()
+        return string.format("%x", math.random(0, 15))
+    end)
+end
+
+-- 获取或创建 DeviceId
+local function get_or_create_device_id()
+    local path = get_device_id_path()
+    local id = nil
+
+    local f = io.open(path, "r")
+    if f then
+        id = f:read("*all")
+        f:close()
+        -- 去除可能的空白字符
+        if id then id = id:gsub("%s+", "") end
+    end
+
+    if id and #id > 0 then
+        msg.debug("[NextUp] 使用本地缓存的 DeviceId: " .. id)
+        return id
+    end
+
+    id = generate_random_id()
+    msg.info("[NextUp] 生成新的 DeviceId: " .. id)
+
+    local fw = io.open(path, "w")
+    if fw then
+        fw:write(id)
+        fw:close()
+        msg.info("[NextUp] DeviceId 已保存到: " .. path)
+    else
+        msg.warn("[NextUp] 无法保存 DeviceId 到文件 (权限问题?)，下次将重新生成。")
+    end
+
+    return id
+end
+
 -- 解析连接参数
 local function get_connection_params(path)
     local params = extract_params(path)
@@ -78,12 +129,22 @@ local function get_connection_params(path)
         current_id = current_id:match("^mediasource_(%d+)")
     end
     
-    if not current_id or not params.DeviceId or not params.api_key then return nil end
+    -- 获取 DeviceId，如果 URL 中没有，则从本地获取或生成
+    local device_id = params.DeviceId
+    if not device_id or device_id == "" then
+        msg.warn("[NextUp] URL 中未找到 DeviceId，尝试使用自动生成的 ID")
+        device_id = get_or_create_device_id()
+    end
+
+    if not current_id or not device_id or not params.api_key then 
+        msg.warn("[NextUp] 缺少必要参数 (Id/API Key)")
+        return nil 
+    end
     
     return {
         server = server,
         current_id = current_id,
-        device_id = params.DeviceId,
+        device_id = device_id,
         api_key = params.api_key,
         play_session_id = params.PlaySessionId or "",
         original_params = params
@@ -196,7 +257,7 @@ local function on_file_loaded()
 
     msg.debug("[NextUp] 开始处理: " .. conn.current_id)
 
-    -- 第一步：获取 UserId
+    -- 获取 UserId
     local url_sessions = string.format("%s/Sessions", conn.server)
     request_async_with_retry(url_sessions, conn.api_key, conn.device_id, client_info, nil, function(sessions)
         if not sessions then return end -- 失败中止
@@ -212,7 +273,7 @@ local function on_file_loaded()
             return 
         end
 
-        -- 第二步：获取当前集信息 & 自动设置标题
+        -- 获取当前集信息 & 自动设置标题
         local url_item = string.format("%s/Users/%s/Items/%s", conn.server, user_id, conn.current_id)
         request_async_with_retry(url_item, conn.api_key, conn.device_id, client_info, nil, function(current_item)
             if not current_item then return end
@@ -234,7 +295,7 @@ local function on_file_loaded()
             
             if current_item.Type ~= "Episode" or not current_item.SeriesId then return end
 
-            -- 第三步：获取下一集 ID
+            -- 获取下一集 ID
             local url_eps = string.format("%s/Shows/%s/Episodes?UserId=%s&Fields=Overview,Chapters,Width,Height,ProviderIds,ParentId,People,CommunityRating&EnableImageTypes=Primary,Backdrop,Thumb,Logo&ImageTypeLimit=1", conn.server, current_item.SeriesId, user_id)
             if current_item.SeasonId then url_eps = url_eps .. "&SeasonId=" .. current_item.SeasonId end
 
@@ -251,7 +312,7 @@ local function on_file_loaded()
 
                 if not next_id then return end -- 季终或未找到
 
-                -- 第四步：获取下一集详细信息 (标题)
+                -- 获取下一集详细信息 (标题)
                 local url_next_info = string.format("%s/Users/%s/Items/%s", conn.server, user_id, next_id)
                 request_async_with_retry(url_next_info, conn.api_key, conn.device_id, client_info, nil, function(next_item_info)
                     local next_title_str = nil
@@ -260,7 +321,7 @@ local function on_file_loaded()
                         if t then next_title_str = t.title end
                     end
 
-                    -- 第五步：获取播放链接
+                    -- 获取播放链接
                     local url_playback = string.format("%s/Items/%s/PlaybackInfo?UserId=%s&IsPlayback=true", conn.server, next_id, user_id)
                     local post_body = [[{"DeviceProfile":{"MaxStreamingBitrate":200000000,"DirectPlayProfiles":[{"Type":"Video"},{"Type":"Audio"}],"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","Context":"Streaming"}]}}]]
                     
