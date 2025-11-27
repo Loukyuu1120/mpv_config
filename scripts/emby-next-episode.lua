@@ -235,7 +235,7 @@ local function parse_title_info(json, episode_id)
         table.insert(title_parts, sn)
     end
     if json.ParentIndexNumber and json.IndexNumber then
-        table.insert(title_parts, string.format("S%02dE%02d", json.ParentIndexNumber, json.IndexNumber))
+        table.insert(title_parts, string.format("S%dE%d", json.ParentIndexNumber, json.IndexNumber))
     end
     if json.Name then table.insert(title_parts, json.Name) end
     
