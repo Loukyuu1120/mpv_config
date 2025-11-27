@@ -1,5 +1,5 @@
 -- emby-playback-reporting.lua
--- MPV to Emby 播放进度回传脚本（支持自定义 User-Agent）
+-- MPV to Emby 播放进度回传脚本（修复关闭弹窗和发送失败问题）
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
@@ -28,7 +28,7 @@ local is_paused = false
 local playback_started = false
 local shutdown_reported = false
 
--- 播放列表信息（目前只支持单文件播放）
+-- 播放列表信息
 local playlist_index = 0
 local playlist_length = 1
 local now_playing_queue = {}
@@ -36,7 +36,6 @@ local now_playing_queue = {}
 -- 从URL中提取参数
 local function extract_emby_parameters(url)
     local params = {}
-    
     local base_url = url:match("^(.-)%?") or url
     local query_string = url:match("%?(.+)")
     if query_string then
@@ -44,14 +43,13 @@ local function extract_emby_parameters(url)
             params[key] = value
         end
     end
-    
     return base_url, params
 end
 
--- 异步HTTP POST请求（用于正常播放时）
+-- 【正常播放时】异步HTTP POST请求
+-- 【正常播放时】异步HTTP POST请求（带结果打印）
 local function post_json_async(url, payload)
     local json_payload = utils.format_json(payload)
-    msg.debug("异步POST " .. url .. " payload: " .. json_payload)
     
     mp.command_native_async({
         name = "subprocess",
@@ -62,28 +60,60 @@ local function post_json_async(url, payload)
             "-H", "User-Agent: " .. ua_string,
             "-d", json_payload,
             "--max-time", "5",
-            "--silent", "--show-error","--ssl-revoke-best-effort"
+            "--silent", "--show-error", "--ssl-revoke-best-effort"
         },
         capture_stdout = true,
         capture_stderr = true
     }, function(success, result, error)
-        if success and result.status == 0 then
-            msg.debug("异步请求成功")
+        -- 这里是回调函数
+        if success then
+            if result.status == 0 then
+                -- curl 执行成功（网络通畅）
+                if result.stdout and result.stdout ~= "" then
+                    msg.debug("Emby 响应: " .. result.stdout) -- 打印服务器返回的具体内容
+                end
+            else
+                -- curl 执行失败（非0退出码，如404/500/超时等）
+                msg.warn("Curl 失败 (代码 " .. result.status .. "):")
+                if result.stderr then
+                    msg.warn(result.stderr) -- 打印 curl 的错误详情
+                end
+                if result.stdout then
+                    msg.warn("服务器返回: " .. result.stdout) -- 即使报错，服务器也可能返回了错误原因 JSON
+                end
+            end
         else
-            msg.debug("异步请求失败: " .. (result.stderr or error or "未知错误"))
+            msg.error("启动 curl 子进程失败: " .. (error or "未知错误"))
         end
     end)
 end
 
+-- 【播放结束/关闭时】分离式进程 POST 请求
+local function post_json_detached(url, payload)
+    local json_payload = utils.format_json(payload)
+    -- 使用 detach = true，MPV 关闭不会杀死这个 curl，也不会等待它
+    mp.command_native({
+        name = "subprocess",
+        args = {
+            "curl", "-X", "POST", url,
+            "-H", "Content-Type: application/json",
+            "-H", "X-Emby-Token: " .. api_key,
+            "-H", "User-Agent: " .. ua_string,
+            "-d", json_payload,
+            "--max-time", "2", -- 超时设短一点
+            "--silent", "--ssl-revoke-best-effort"
+        },
+        detach = true,         -- 分离进程
+        capture_stdout = false, -- 分离模式下不能捕获输出
+        capture_stderr = false
+    })
+end
+
 -- 播放开始
 local function report_playback_start()
-    if not emby_server or not api_key or not play_session_id then 
-        msg.debug("缺少必要参数，跳过播放开始报告")
-        return 
-    end
+    if not emby_server or not api_key or not play_session_id then return end
 
     local url = emby_server .. "/Sessions/Playing"
-
     local payload = {
         ItemId = media_source_id:match("mediasource_(%d+)") or "",
         MediaSourceId = media_source_id,
@@ -100,16 +130,14 @@ local function report_playback_start()
         RepeatMode = "RepeatNone",
         PlaybackStartTimeTicks = math.floor(os.time() * 10000000)
     }
-
     post_json_async(url, payload)
 end
 
--- 播放进度（播放中/暂停/跳转）
+-- 播放进度
 local function report_playback_progress(position, paused_flag)
     if not emby_server or not api_key or not play_session_id then return end
 
     local url = emby_server .. "/Sessions/Playing/Progress"
-
     local payload = {
         ItemId = media_source_id:match("mediasource_(%d+)") or "",
         MediaSourceId = media_source_id,
@@ -125,29 +153,21 @@ local function report_playback_progress(position, paused_flag)
         PlayMethod = "DirectStream",
         RepeatMode = "RepeatNone"
     }
-
     post_json_async(url, payload)
 end
 
--- 播放停止（异步版本，用于播放结束或MPV关闭）
+-- 播放停止 (核心修改)
 local function report_playback_stopped()
-    if shutdown_reported then
-        msg.debug("已经报告过关闭，跳过重复报告")
-        return
-    end
+    if shutdown_reported then return end
     
     if not playback_started or not emby_server or not api_key or not play_session_id then 
-        msg.debug("播放未开始或缺少必要参数，跳过停止报告")
         return 
     end
 
     local position = mp.get_property_number("time-pos", 0)
-    if position == nil then
-        position = last_position
-    end
+    if position == nil then position = last_position end
 
     local url = emby_server .. "/Sessions/Playing/Stopped"
-
     local payload = {
         ItemId = media_source_id:match("mediasource_(%d+)") or "",
         MediaSourceId = media_source_id,
@@ -163,16 +183,16 @@ local function report_playback_stopped()
         RepeatMode = "RepeatNone"
     }
 
-    msg.debug("异步报告播放停止，位置: " .. position .. "秒")
-    post_json_async(url, payload)
+    -- 使用分离式请求，无弹窗且不会被 kill
+    post_json_detached(url, payload)
+    
     shutdown_reported = true
     playback_started = false
 end
 
--- 定期回传播放进度
+-- 定时器
 local function tick()
     if not playback_started or is_paused then return end
-
     local current_time = mp.get_time()
     local position = mp.get_property_number("time-pos", 0)
 
@@ -183,7 +203,7 @@ local function tick()
     end
 end
 
--- 暂停/恢复
+-- 暂停处理
 local function on_pause_change(name, value)
     is_paused = value
     if playback_started then
@@ -196,33 +216,21 @@ local function on_pause_change(name, value)
     end
 end
 
--- 文件加载初始化
+-- 文件加载
 local function on_file_loaded()
     local path = mp.get_property("path", "")
-
     if path:find("emby") then
         current_file_path = path
         local base_url, params = extract_emby_parameters(path)
-
         emby_server = base_url:match("(https?://[^/]+)")
         device_id = params.DeviceId or ""
         media_source_id = params.MediaSourceId or ""
         play_session_id = params.PlaySessionId or ""
         api_key = params.api_key or ""
 
-        -- 构建播放列表
-        now_playing_queue = {
-            {
-                Id = media_source_id:match("mediasource_(%d+)") or "",
-                PlaylistItemId = "playlistItem0"
-            }
-        }
+        now_playing_queue = {{ Id = media_source_id:match("mediasource_(%d+)") or "", PlaylistItemId = "playlistItem0" }}
 
-        msg.info("检测到Emby流媒体，初始化回传功能")
-        msg.debug(string.format("服务器: %s, 媒体源: %s, 会话: %s", 
-                                emby_server, media_source_id, play_session_id))
-
-        -- 重置关闭状态
+        msg.info("Emby 回传初始化: " .. media_source_id)
         shutdown_reported = false
         
         mp.add_timeout(0.5, function()
@@ -230,26 +238,21 @@ local function on_file_loaded()
             playback_started = true
         end)
     else
-        msg.debug("非Emby流媒体，跳过回传功能")
         playback_started = false
     end
 end
 
--- 文件结束（播放完成）
-local function on_file_ended()
-    msg.debug("文件播放结束")
-    report_playback_stopped()
+local function on_unload_hook()
+    if playback_started then
+        msg.debug("Hook触发：汇报停止")
+        report_playback_stopped()
+    end
 end
 
--- 播放结束
-local function on_shutdown()
-    msg.debug("MPV关闭，异步报告播放停止")
-    report_playback_stopped()
-end
-
--- 注册事件和定时器
+-- 注册事件
 mp.register_event("file-loaded", on_file_loaded)
-mp.register_event("end-file", on_file_ended)
-mp.register_event("shutdown", on_shutdown)
 mp.observe_property("pause", "bool", on_pause_change)
 mp.add_periodic_timer(1, tick)
+
+-- 使用 Hook 替代 shutdown 事件
+mp.add_hook("on_unload", 50, on_unload_hook)
