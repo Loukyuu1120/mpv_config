@@ -1,5 +1,5 @@
 -- emby-playback-reporting.lua
--- MPV to Emby 播放进度回传脚本（修复关闭弹窗和发送失败问题）
+-- MPV to Emby 播放进度回传脚本
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
@@ -47,10 +47,9 @@ local function extract_emby_parameters(url)
 end
 
 -- 【正常播放时】异步HTTP POST请求
--- 【正常播放时】异步HTTP POST请求（带结果打印）
 local function post_json_async(url, payload)
     local json_payload = utils.format_json(payload)
-    
+
     mp.command_native_async({
         name = "subprocess",
         args = {
@@ -115,7 +114,7 @@ local function report_playback_start()
 
     local url = emby_server .. "/Sessions/Playing"
     local payload = {
-        ItemId = media_source_id:match("mediasource_(%d+)") or "",
+        ItemId = media_source_id:match("mediasource_(%d+)") or media_source_id,
         MediaSourceId = media_source_id,
         PlaySessionId = play_session_id,
         CanSeek = true,
@@ -139,7 +138,7 @@ local function report_playback_progress(position, paused_flag)
 
     local url = emby_server .. "/Sessions/Playing/Progress"
     local payload = {
-        ItemId = media_source_id:match("mediasource_(%d+)") or "",
+        ItemId = media_source_id:match("mediasource_(%d+)") or media_source_id,
         MediaSourceId = media_source_id,
         PlaySessionId = play_session_id,
         CanSeek = true,
@@ -159,9 +158,9 @@ end
 -- 播放停止 (核心修改)
 local function report_playback_stopped()
     if shutdown_reported then return end
-    
-    if not playback_started or not emby_server or not api_key or not play_session_id then 
-        return 
+
+    if not playback_started or not emby_server or not api_key or not play_session_id then
+        return
     end
 
     local position = mp.get_property_number("time-pos", 0)
@@ -185,7 +184,7 @@ local function report_playback_stopped()
 
     -- 使用分离式请求，无弹窗且不会被 kill
     post_json_detached(url, payload)
-    
+
     shutdown_reported = true
     playback_started = false
 end
@@ -232,7 +231,7 @@ local function on_file_loaded()
 
         msg.info("Emby 回传初始化: " .. media_source_id)
         shutdown_reported = false
-        
+
         mp.add_timeout(0.5, function()
             report_playback_start()
             playback_started = true
