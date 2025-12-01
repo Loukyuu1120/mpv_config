@@ -2,6 +2,7 @@ local utils = require 'mp.utils'
 local msg = mp.msg
 
 local is_processing = false
+local initial_selection_done = false -- 标记：是否已完成初始选轨
 
 -- 辅助函数：提取 ID
 local function extract_ids_from_video_path(path)
@@ -55,6 +56,64 @@ local function fix_subtitle_url(sub_url, target_itemId, target_msId)
     return sub_url, false
 end
 
+-- 独立出来的选轨逻辑函数
+local function select_best_subtitle()
+    local tracks = mp.get_property_native("track-list")
+    local current_sid = mp.get_property_number("sid") or -1
+    
+    local first_sid = nil       -- 保底：第一个字幕
+    local priority_sid = nil    -- 最终选定的 ID
+    local current_prio = 99     -- 优先级：1=简中, 2=繁中, 99=未匹配
+
+    for _, track in ipairs(tracks) do
+        if track.type == "sub" then
+            -- 记录第一个遇到的字幕作为保底
+            if not first_sid then
+                first_sid = track.id
+            end
+
+            -- 组合语言代码和标题进行匹配 (增加准确性，Emby 常在 title 里写语言)
+            local lang = (track.lang or ""):lower()
+            local title = (track.title or ""):lower()
+            local full_info = lang .. " " .. title
+
+            -- 匹配规则：zh-hans, zh-cn, chi, chs, sc (title中常见)
+            if full_info:find("zh%-hans") or full_info:find("zh%-cn") or 
+               full_info:find("chi") or full_info:find("chs") or 
+               title:find("simplified") then
+                priority_sid = track.id
+                current_prio = 1
+                break -- 找到最高优先级，直接结束循环
+            end
+
+            -- 只有当还没找到简体中文时才记录
+            if current_prio > 1 then
+                -- 匹配规则：zh-hant, zh-tw, cht, tc (title中常见)
+                if full_info:find("zh%-hant") or full_info:find("zh%-tw") or 
+                   full_info:find("cht") or title:find("traditional") then
+                    if current_prio > 2 then 
+                        priority_sid = track.id
+                        current_prio = 2
+                    end
+                end
+            end
+        end
+    end
+
+    -- 决策：有优先的用优先的，没有就用第一个
+    local final_sid = priority_sid or first_sid
+
+    if final_sid then
+        -- 只有当目标 ID 与当前不同时才切换，避免刷新闪烁
+        if final_sid ~= current_sid then
+            msg.warn(">>> 自动选轨: ID " .. final_sid .. " (优先级: " .. (current_prio == 1 and "简体" or (current_prio == 2 and "繁体" or "默认")) .. ")")
+            mp.set_property("sid", final_sid)
+        else
+            msg.verbose("当前已是最佳字幕轨道，无需切换。")
+        end
+    end
+end
+
 local function reload_subtitles()
     if is_processing then return end
     is_processing = true
@@ -73,9 +132,7 @@ local function reload_subtitles()
 
     local sub_tracks = mp.get_property_native("track-list")
     local has_changes = false
-    
-    -- 执行批量替换
-    -- 注意：这里 sub_add 不传 "select"，防止处理过程中画面乱跳
+
     for _, track in ipairs(sub_tracks) do
         if track.type == "sub" and track.external then
             local sub_url = track["external-filename"] or track.src
@@ -84,40 +141,24 @@ local function reload_subtitles()
                 if needs_fix then
                     msg.verbose("修正并替换字幕轨道: " .. track.id)
                     mp.commandv("sub_remove", track.id)
-                    mp.commandv("sub_add", new_url) -- 仅添加，暂不选中
+                    mp.commandv("sub_add", new_url) 
                     has_changes = true
                 end
             end
         end
     end
 
-    -- 如果没有改动，直接退出，保持当前选中状态不变
-    if not has_changes then
+    if has_changes or not initial_selection_done then
+        local delay = has_changes and 0.1 or 0.05 -- 如果有修改，多等一会等列表刷新
+        
+        mp.add_timeout(delay, function()
+            select_best_subtitle()
+            initial_selection_done = true -- 标记已完成，防止后续手动切换字幕被脚本覆盖
+            is_processing = false
+        end)
+    else
         is_processing = false
-        return
     end
-
-    -- 强制选中第一个字幕
-    -- 稍微延迟一点点，确保 sub_add 指令已被 MPV 消化，列表已更新
-    mp.add_timeout(0.1, function()
-        local new_tracks = mp.get_property_native("track-list")
-        local first_sub_id = nil
-        
-        -- 寻找列表中的第一个字幕轨道 (ID最小的或者列表顺序最前的)
-        for _, track in ipairs(new_tracks) do
-            if track.type == "sub" then
-                first_sub_id = track.id
-                break -- 找到第一个就停止
-            end
-        end
-
-        if first_sub_id then
-            msg.warn(">>> EMBY 字幕修正完成，强制选中第一个字幕 ID: " .. first_sub_id)
-            mp.set_property("sid", first_sub_id)
-        end
-        
-        is_processing = false
-    end)
 end
 
 -- 防抖
@@ -130,7 +171,9 @@ local function on_tracks_changed()
     end)
 end
 
+-- 每次新文件加载，重置状态
 mp.register_event("file-loaded", function()
+    initial_selection_done = false -- 重置标记
     mp.add_timeout(0, reload_subtitles)
 end)
 
