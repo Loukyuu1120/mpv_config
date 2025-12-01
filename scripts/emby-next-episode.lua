@@ -64,10 +64,6 @@ local function get_server_base_url(url)
     return url:match("^(https?://[^/?#]+)")
 end
 
--- ===========================================================================
--- 新增功能：DeviceId 持久化存储与生成
--- ===========================================================================
-
 -- 获取存储 DeviceId 的文件路径 (位于 script-opts 目录下)
 local function get_device_id_path()
     return mp.command_native({"expand-path", "~~/script-opts/emby_generated_id.txt"})
@@ -132,12 +128,10 @@ local function get_connection_params(path)
     -- 获取 DeviceId，如果 URL 中没有，则从本地获取或生成
     local device_id = params.DeviceId
     if not device_id or device_id == "" then
-        msg.warn("[NextUp] URL 中未找到 DeviceId，尝试使用自动生成的 ID")
         device_id = get_or_create_device_id()
     end
 
     if not current_id or not device_id or not params.api_key then 
-        msg.warn("[NextUp] 缺少必要参数 (Id/API Key)")
         return nil 
     end
     
@@ -248,7 +242,7 @@ end
 -- 主逻辑
 local function on_file_loaded()
     local path = mp.get_property("path", "")
-    if not path:find("^http") then return end
+    if not path:find("^http") or not path:find("/emby") then return end
 
     local conn = get_connection_params(path)
     if not conn then return end
