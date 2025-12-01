@@ -91,3 +91,7 @@
 ### 4. emby-sub-fix.lua
 
 EMBY外挂字幕的时候自动下一集时往往字幕url不更新。该脚本会自动检测当前播放的 Emby 视频路径，提取正确的 `ItemId` 和 `MediaSourceId`，并实时修正所有外挂字幕的 URL，最后自动选中第一个字幕轨道。
+
+### 5. recent.lua
+
+Fixed from [recent/recent.lua at master · hacel/recent · GitHub](https://github.com/hacel/recent/blob/master/recent.lua)
